@@ -1,0 +1,1 @@
+"""Vasuli application package."""

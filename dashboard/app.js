@@ -1,0 +1,238 @@
+/*
+ * Vasuli dashboard logic. Talks to the FastAPI backend (app/main.py) which
+ * serves this same folder, so all API calls are same-origin.
+ */
+
+const API = '';
+let policyChartInstance = null;
+
+function inr(n) {
+  return 'Rs ' + Number(n || 0).toLocaleString('en-IN', { maximumFractionDigits: 2 });
+}
+
+function showToast(message, type = 'error') {
+  const toast = document.getElementById('toast');
+  toast.textContent = message;
+  toast.className = 'toast show' + (type === 'success' ? ' success' : '');
+  clearTimeout(showToast._t);
+  showToast._t = setTimeout(() => { toast.className = 'toast'; }, 4000);
+}
+
+async function runBatch() {
+  const btn = document.getElementById('runBtn');
+  btn.disabled = true;
+  btn.textContent = 'Running…';
+  try {
+    await fetch(API + '/api/run-batch', { method: 'POST' });
+    await loadAll();
+    showToast('Batch run complete — dashboard updated.', 'success');
+  } catch (e) {
+    showToast('Run failed: ' + e, 'error');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Run recovery batch';
+  }
+}
+
+async function loadAll() {
+  try {
+    const [summary, events, exceptions] = await Promise.all([
+      fetch(API + '/api/summary').then(r => r.json()),
+      fetch(API + '/api/events').then(r => r.json()),
+      fetch(API + '/api/exceptions').then(r => r.json()),
+    ]);
+    renderHero(summary);
+    renderFunnel(summary);
+    renderFeed(events);
+    renderExceptions(exceptions);
+    renderBacktest();
+  } catch (e) {
+    // Backend not running yet -- leave the empty states in place, don't crash the page.
+    console.warn('Vasuli: could not load API data yet.', e);
+  }
+}
+
+function renderHero(s) {
+  document.getElementById('heroNet').textContent = inr(s.total_net_recovered_inr);
+  document.getElementById('heroFlagged').textContent = inr(s.total_flagged_inr);
+  document.getElementById('heroEvents').textContent = `${s.total_events} events in batch`;
+  document.getElementById('heroRate').innerHTML = `${s.recovery_rate_pct}<small>%</small>`;
+  document.getElementById('heroResolved').textContent = `${s.resolved_count} resolved`;
+  document.getElementById('statCost').textContent = inr(s.total_outreach_cost_inr);
+  const esc = (s.by_channel.human_escalation || {}).attempts || 0;
+  document.getElementById('statEscalations').textContent = esc;
+  document.getElementById('statExceptions').textContent = s.exception_count;
+  document.getElementById('statBlocks').textContent = esc; // escalations are the visible compliance-block proxy
+}
+
+function renderFunnel(s) {
+  const order = ['auto_retry', 'email', 'whatsapp', 'human_escalation'];
+  const names = { auto_retry: 'Auto-retry', email: 'Email', whatsapp: 'WhatsApp', human_escalation: 'Human' };
+  const max = Math.max(1, ...order.map(k => (s.by_channel[k] || {}).attempts || 0));
+  const el = document.getElementById('funnelBars');
+  el.innerHTML = order.map(k => {
+    const c = s.by_channel[k] || { attempts: 0, successes: 0 };
+    const pct = Math.round(100 * (c.attempts || 0) / max);
+    return `<div class="funnel-bar">
+      <div class="funnel-label">${names[k]}</div>
+      <div class="funnel-track"><div class="funnel-fill" style="width:${pct}%"></div></div>
+      <div class="funnel-val">${c.successes}/${c.attempts}</div>
+    </div>`;
+  }).join('');
+}
+
+function renderFeed(events) {
+  const el = document.getElementById('decisionFeed');
+  if (!events.length) {
+    el.innerHTML = '<div class="empty-state">Run a batch to see decisions here.</div>';
+    return;
+  }
+  el.innerHTML = events.slice(0, 25).map(e => {
+    const stampClass = e.resolved ? 'approved' : (e.attempt_count >= 3 ? 'blocked' : 'approved');
+    const stampText = e.resolved ? 'RECOVERED' : (e.attempt_count >= 3 ? 'EXCEPTION' : 'IN PROGRESS');
+    return `<div class="decision-row" onclick="openAudit('${e.event_id}')">
+      <div class="stamp ${stampClass}">${stampText}</div>
+      <div class="d-main">
+        <div class="d-title">${e.customer_id} · ${e.loss_type.replace('_', ' ')}</div>
+        <div class="d-detail">${e.event_id} · ${e.attempt_count} attempt(s)</div>
+      </div>
+      <div class="d-amount">${inr(e.amount_inr)}</div>
+    </div>`;
+  }).join('');
+}
+
+function renderExceptions(list) {
+  const el = document.getElementById('exceptionsTable');
+  if (!list.length) {
+    el.innerHTML = '<div class="empty-state">No exceptions — everything resolved or still within retry budget.</div>';
+    return;
+  }
+  el.innerHTML = `<table><thead><tr><th>Event</th><th>Customer</th><th>Amount</th><th>Attempts</th><th>Why unresolved</th></tr></thead><tbody>
+    ${list.map(e => `<tr>
+      <td class="mono">${e.event_id}</td>
+      <td>${e.customer_id}</td>
+      <td class="mono">${inr(e.amount_inr)}</td>
+      <td>${e.attempt_count}/3</td>
+      <td>Max attempts reached, moved to manual review</td>
+    </tr>`).join('')}
+  </tbody></table>`;
+}
+
+function renderBacktest() {
+  // Static values from backtest/backtest_report.json, generated by
+  // `python backtest/run_backtest.py`. Hardcoded here since the dashboard
+  // reads live event data via the API but the backtest is an offline,
+  // separate report by design (see README) -- update these two numbers
+  // after re-running the backtest if your batch changes.
+  const netCostAware = 171567.60;
+  const netAggressive = 217951.00;
+
+  const el = document.getElementById('policyCompare');
+  el.innerHTML = `
+    <div class="policy-card">
+      <div class="policy-name">Cost-aware ladder (default)</div>
+      <div class="policy-net">${inr(netCostAware)}</div>
+      <div class="policy-note">54.5% resolved. Every action passes the same compliance checks (AFA threshold, pre-debit cooldown) a human auditor would apply.</div>
+    </div>
+    <div class="policy-card winner">
+      <div class="policy-name">Aggressive</div>
+      <div class="policy-net">${inr(netAggressive)}</div>
+      <div class="policy-note">63.6% resolved, ~21% more net revenue — but earns it by skipping the 24h pre-debit notice cooldown. Higher revenue, higher compliance risk. Not used as the default for exactly this reason.</div>
+    </div>`;
+
+  const canvas = document.getElementById('policyChart');
+  if (canvas && window.Chart) {
+    if (policyChartInstance) policyChartInstance.destroy();
+    policyChartInstance = new Chart(canvas, {
+      type: 'bar',
+      data: {
+        labels: ['Cost-aware ladder (default)', 'Aggressive'],
+        datasets: [{
+          data: [netCostAware, netAggressive],
+          backgroundColor: ['#8A6F3B', '#D4A24C'],
+          borderRadius: 6,
+          barThickness: 56,
+        }],
+      },
+      options: {
+        indexAxis: 'y',
+        responsive: true,
+        plugins: {
+          legend: { display: false },
+          tooltip: {
+            callbacks: { label: (ctx) => 'Net recovered: ' + inr(ctx.parsed.x) },
+          },
+        },
+        scales: {
+          x: {
+            ticks: { color: '#8B93A0', callback: (v) => 'Rs ' + (v / 1000) + 'k' },
+            grid: { color: '#2A3441' },
+          },
+          y: {
+            ticks: { color: '#E8E4DA', font: { size: 12 } },
+            grid: { display: false },
+          },
+        },
+      },
+    });
+  }
+}
+
+async function openAudit(eventId) {
+  const backdrop = document.getElementById('modalBackdrop');
+  const body = document.getElementById('modalBody');
+  document.getElementById('modalTitle').textContent = 'Audit Trail — ' + eventId;
+  body.innerHTML = 'Loading…';
+  backdrop.classList.add('open');
+  try {
+    const records = await fetch(API + '/api/audit/' + eventId).then(r => r.json());
+    body.innerHTML = records.map(r => `
+      <div class="audit-step">
+        <span class="audit-stage">${r.stage}</span>
+        <span class="audit-time">${new Date(r.timestamp).toLocaleString()}</span>
+        <div class="audit-payload">${JSON.stringify(r.payload, null, 2)}</div>
+      </div>`).join('');
+  } catch (e) {
+    body.innerHTML = 'Could not load audit trail: ' + e;
+  }
+}
+
+function closeModal() {
+  document.getElementById('modalBackdrop').classList.remove('open');
+}
+
+function handleContactSubmit(evt) {
+  evt.preventDefault();
+  const name = document.getElementById('cName').value;
+  const email = document.getElementById('cEmail').value;
+  const msg = document.getElementById('cMsg').value;
+
+  const subject = encodeURIComponent(`Vasuli project — message from ${name}`);
+  const body = encodeURIComponent(`${msg}\n\n— ${name} (${email})`);
+  window.location.href = `mailto:amanpathak66606@gmail.com?subject=${subject}&body=${body}`;
+
+  const note = document.getElementById('formNote');
+  note.textContent = 'Opening your email app with this message pre-filled — send it from there.';
+  evt.target.reset();
+}
+
+function setupScrollReveal() {
+  const targets = document.querySelectorAll('.section-pad, .hero-section');
+  if (!('IntersectionObserver' in window)) {
+    targets.forEach(t => t.classList.add('in-view'));
+    return;
+  }
+  const observer = new IntersectionObserver((entries) => {
+    entries.forEach(entry => {
+      if (entry.isIntersecting) {
+        entry.target.classList.add('in-view');
+        observer.unobserve(entry.target);
+      }
+    });
+  }, { threshold: 0.08 });
+  targets.forEach(t => observer.observe(t));
+}
+
+setupScrollReveal();
+renderBacktest();
+loadAll();
